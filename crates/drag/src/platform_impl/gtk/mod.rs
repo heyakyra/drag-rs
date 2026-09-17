@@ -14,6 +14,7 @@ use gtk::{
     },
 };
 use std::{
+    cell::Cell,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -44,9 +45,17 @@ pub fn start_drag<F: Fn(DragResult, CursorPosition) + Send + 'static>(
                 .unwrap()
                 .push(window.connect_drag_data_get(move |_, _, data, _, _| {
                     log::debug!("Preparing URIs for drag data");
+                    // Percent-encode: `set_uris` converts the list to ASCII and
+                    // silently sets nothing if any byte is non-ASCII.
                     let uris: Vec<String> = paths
                         .iter()
-                        .map(|path| format!("file://{}", path.display()))
+                        .filter_map(|path| match gtk::glib::filename_to_uri(path, None) {
+                            Ok(uri) => Some(uri.to_string()),
+                            Err(e) => {
+                                log::warn!("Failed to build URI for {}: {}", path.display(), e);
+                                None
+                            }
+                        })
                         .collect();
                     let uris: Vec<&str> = uris.iter().map(|s| s.as_str()).collect();
                     log::debug!("Setting URIs: {:?}", uris);
@@ -71,9 +80,14 @@ pub fn start_drag<F: Fn(DragResult, CursorPosition) + Send + 'static>(
             -1,
         ) {
             log::debug!("Drag context created successfully");
-            let callback = Rc::new(on_drop_callback);
-            on_drop_failed(callback.clone(), window, &handler_ids, &options);
-            on_drop_performed(callback.clone(), window, &handler_ids, &drag_context);
+            // `drop-performed` fires before the target requests the data, so
+            // the result is only recorded there. Cleanup and the callback wait
+            // for `drag-end`, which GTK emits after the data transfer finished
+            // (or the drag was cancelled).
+            let result = Rc::new(Cell::new(DragResult::Cancel));
+            on_drop_failed(result.clone(), window, &handler_ids, &options);
+            on_drop_performed(result.clone(), &drag_context);
+            on_drag_end(on_drop_callback, result, window, &handler_ids);
 
             log::debug!("Setting up drag icon");
             let icon_pixbuf: Option<gdk_pixbuf::Pixbuf> = match &image {
@@ -112,16 +126,13 @@ fn clear_signal_handlers(window: &gtk::ApplicationWindow, handler_ids: &mut Vec<
     }
 }
 
-fn on_drop_failed<F: Fn(DragResult, CursorPosition) + Send + 'static>(
-    callback: Rc<F>,
+fn on_drop_failed(
+    result: Rc<Cell<DragResult>>,
     window: &gtk::ApplicationWindow,
     handler_ids: &Arc<Mutex<Vec<SignalHandlerId>>>,
     options: &Options,
 ) {
     log::debug!("Setting up drop failed handler");
-    let window_clone = window.clone();
-    let handler_ids_clone = handler_ids.clone();
-
     let skip_animatation_on_cancel_or_failure = options.skip_animatation_on_cancel_or_failure;
 
     handler_ids
@@ -129,12 +140,7 @@ fn on_drop_failed<F: Fn(DragResult, CursorPosition) + Send + 'static>(
         .unwrap()
         .push(window.connect_drag_failed(move |_, _, _drag_result| {
             log::debug!("Drag failed or cancelled");
-            callback(
-                DragResult::Cancel,
-                get_cursor_position(&window_clone).unwrap(),
-            );
-
-            cleanup_signal_handlers(&handler_ids_clone, &window_clone);
+            result.set(DragResult::Cancel);
             if skip_animatation_on_cancel_or_failure {
                 Propagation::Stop
             } else {
@@ -154,23 +160,33 @@ fn cleanup_signal_handlers(
     log::debug!("Signal handlers cleaned up");
 }
 
-fn on_drop_performed<F: Fn(DragResult, CursorPosition) + Send + 'static>(
-    callback: Rc<F>,
-    window: &gtk::ApplicationWindow,
-    handler_ids: &Arc<Mutex<Vec<SignalHandlerId>>>,
-    drag_context: &gdk::DragContext,
-) {
+fn on_drop_performed(result: Rc<Cell<DragResult>>, drag_context: &gdk::DragContext) {
     log::debug!("Setting up drop performed handler");
-    let window = window.clone();
-    let handler_ids = handler_ids.clone();
-
     drag_context.connect_drop_performed(move |context, _| {
-        log::debug!("Drop performed successfully");
+        log::debug!("Drop performed, waiting for drag-end");
         log::trace!("Selected action: {:?}", context.selected_action());
         log::trace!("Suggested action: {:?}", context.suggested_action());
-        cleanup_signal_handlers(&handler_ids, &window);
-        callback(DragResult::Dropped, get_cursor_position(&window).unwrap());
+        result.set(DragResult::Dropped);
     });
+}
+
+fn on_drag_end<F: Fn(DragResult, CursorPosition) + Send + 'static>(
+    callback: F,
+    result: Rc<Cell<DragResult>>,
+    window: &gtk::ApplicationWindow,
+    handler_ids: &Arc<Mutex<Vec<SignalHandlerId>>>,
+) {
+    log::debug!("Setting up drag end handler");
+    let handler_ids_clone = handler_ids.clone();
+
+    handler_ids
+        .lock()
+        .unwrap()
+        .push(window.connect_drag_end(move |window, _| {
+            log::debug!("Drag ended with result: {:?}", result.get());
+            cleanup_signal_handlers(&handler_ids_clone, window);
+            callback(result.get(), get_cursor_position(window).unwrap());
+        }));
 }
 
 fn get_cursor_position(window: &gtk::ApplicationWindow) -> Result<CursorPosition, Error> {
